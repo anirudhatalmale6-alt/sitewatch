@@ -14,6 +14,7 @@ Run from cron:
   */5 * * * * /opt/sitewatch/sitewatch.py >/dev/null 2>&1
 """
 
+import html
 import json
 import os
 import re
@@ -26,6 +27,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+from concurrent.futures import ThreadPoolExecutor
 from email.message import EmailMessage
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -43,6 +45,7 @@ DEFAULTS = {
     "RETRY_WAIT": "10",
     "USER_AGENT": "sitewatch/1.0 (uptime monitor)",
     "LOG_KEEP_LINES": "5000",
+    "THREADS": "12",
 }
 
 
@@ -95,7 +98,15 @@ def load_sites():
                 url = parts[0]
                 keyword = parts[1] if len(parts) > 1 and parts[1] else None
                 expect = int(parts[2]) if len(parts) > 2 and parts[2] else 200
-                sites.append({"url": url, "keyword": keyword, "expect": expect})
+                # 4th column "offsite-ok" allows a deliberate redirect to a
+                # different domain (one brand pointing at another).
+                flags = parts[3].lower() if len(parts) > 3 else ""
+                sites.append({
+                    "url": url,
+                    "keyword": keyword,
+                    "expect": expect,
+                    "offsite_ok": "offsite-ok" in flags,
+                })
     except FileNotFoundError:
         log("ERROR: %s not found" % SITES_FILE)
     return sites
@@ -169,7 +180,8 @@ def check_once(site, cfg):
             elapsed = int((time.time() - started) * 1000)
             # bare -> www is fine; landing on a different site is not
             # (parked domain, hijacked DNS, expired registration)
-            if host and final_host and registrable(final_host) != registrable(host):
+            if (host and final_host and not site.get("offsite_ok")
+                    and registrable(final_host) != registrable(host)):
                 return (
                     False,
                     "redirected off-site to %s" % final_host,
@@ -186,8 +198,10 @@ def check_once(site, cfg):
         return False, "HTTP %s (wanted %s)" % (code, site["expect"]), elapsed
 
     if site["keyword"]:
-        # strip tags so a keyword split by markup still matches
-        text = re.sub(r"<[^>]+>", " ", body)
+        # strip tags so a keyword split by markup still matches, and decode
+        # entities so a keyword containing & or ' matches "&amp;" / "&#039;"
+        text = html.unescape(re.sub(r"<[^>]+>", " ", body))
+        text = re.sub(r"\s+", " ", text)
         if site["keyword"].lower() not in text.lower():
             return False, 'keyword "%s" missing' % site["keyword"], elapsed
 
@@ -298,9 +312,14 @@ def main():
     state = load_state()
     changed = False
 
-    for site in sites:
+    # Check concurrently - a hundred sites one at a time would not finish
+    # inside a 5 minute cron slot, especially once retries kick in.
+    workers = max(1, min(int(cfg["THREADS"]), len(sites)))
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        results = list(pool.map(lambda s: check(s, cfg), sites))
+
+    for site, (ok, detail, ms) in zip(sites, results):
         url = site["url"]
-        ok, detail, ms = check(site, cfg)
         prev = state.get(url, {})
         was_ok = prev.get("ok", True)
 
